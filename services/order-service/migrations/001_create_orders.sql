@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS orders (
+    id UUID PRIMARY KEY,
+    amount_cents BIGINT NOT NULL CHECK (amount_cents > 0),
+    status VARCHAR(30) NOT NULL DEFAULT 'PENDING',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
