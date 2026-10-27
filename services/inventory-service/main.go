@@ -20,6 +20,7 @@ func main() {
 	}
 	defer db.Close()
 	go consumePaymentResults(context.Background())
+	go runInventoryOutboxPublisher(context.Background(), db)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if err := db.PingContext(r.Context()); err != nil {
 			http.Error(w, "Database unavailable", http.StatusServiceUnavailable)

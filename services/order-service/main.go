@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -118,6 +120,38 @@ func main() {
 			AmountCents: req.AmountCents,
 			Status:      "PENDING",
 		})
+	})
+	http.HandleFunc("/orders/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		id := strings.TrimPrefix(r.URL.Path, "/orders/")
+		if _, err := uuid.Parse(id); err != nil {
+			http.Error(w, "Invalid order ID", http.StatusBadRequest)
+			return
+		}
+
+		var order Order
+		err := db.QueryRow(
+			`SELECT id, amount_cents, status FROM orders WHERE id = $1`,
+			id,
+		).Scan(&order.ID, &order.AmountCents, &order.Status)
+
+		if err != nil {
+			if err == sql.ErrNoRows {
+				http.Error(w, "Order not found", http.StatusNotFound)
+				return
+			}
+
+			log.Println("Failed to retrieve order:", err)
+			http.Error(w, "Failed to retrieve order", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(order)
 	})
 
 	log.Println("Order Service listening on :8080")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log"
 
@@ -23,25 +24,26 @@ type RefundResultEvent struct {
 
 func consumeRefundRequests(ctx context.Context) {
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers:  []string{"localhost:9092"},
-		Topic:    "refund-requests",
-		GroupID:  "payment-service-refunds",
-		MinBytes: 1,
-		MaxBytes: 10e6,
+		Brokers:        []string{"localhost:9092"},
+		Topic:          "refund-requests",
+		GroupID:        "payment-service-refunds",
+		MinBytes:       1,
+		MaxBytes:       10e6,
+		CommitInterval: 0,
 	})
 	defer reader.Close()
 
-	writer := &kafka.Writer{
-		Addr:     kafka.TCP("localhost:9092"),
-		Topic:    "refund-results",
-		Balancer: &kafka.Hash{},
+	db, err := connectDB()
+	if err != nil {
+		log.Println("Refund database connection failed:", err)
+		return
 	}
-	defer writer.Close()
+	defer db.Close()
 
 	log.Println("Payment Service consuming refund-requests")
 
 	for {
-		message, err := reader.ReadMessage(ctx)
+		message, err := reader.FetchMessage(ctx)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -61,32 +63,71 @@ func consumeRefundRequests(ctx context.Context) {
 			continue
 		}
 
-		log.Printf("Simulating refund for order %s; reason: %s",
-			request.OrderID, request.Reason)
-
-		// Simulate a successful refund for now.
-		result := RefundResultEvent{
-			EventID:   request.EventID,
-			EventType: "RefundSucceeded",
-			OrderID:   request.OrderID,
-			Status:    "SUCCEEDED",
-		}
-
-		payload, err := json.Marshal(result)
-		if err != nil {
-			log.Println("Failed to encode refund result:", err)
+		if err := processRefundRequest(ctx, db, request); err != nil {
+			log.Println("Failed to persist refund:", err)
 			continue
 		}
 
-		if err := writer.WriteMessages(ctx, kafka.Message{
-			Key:   []byte(request.OrderID),
-			Value: payload,
-		}); err != nil {
-			log.Println("Failed to publish refund result:", err)
-			continue
+		if err := reader.CommitMessages(ctx, message); err != nil {
+			log.Println("Failed to commit refund request:", err)
 		}
-
-		log.Printf("Published refund result for order %s: %s",
-			request.OrderID, result.Status)
 	}
+}
+
+func processRefundRequest(
+	ctx context.Context,
+	db *sql.DB,
+	request RefundRequestEvent,
+) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	result := RefundResultEvent{
+		EventID:   request.EventID,
+		EventType: "RefundSucceeded",
+		OrderID:   request.OrderID,
+		Status:    "SUCCEEDED",
+	}
+
+	payload, err := json.Marshal(result)
+	if err != nil {
+		return err
+	}
+
+	inserted, err := tx.ExecContext(ctx, `
+		INSERT INTO refunds (order_id, event_id, status)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (order_id) DO NOTHING
+	`, request.OrderID, request.EventID, result.Status)
+	if err != nil {
+		return err
+	}
+
+	rows, err := inserted.RowsAffected()
+	if err != nil {
+		return err
+	}
+
+	if rows == 0 {
+		log.Printf("Refund already recorded for order %s", request.OrderID)
+		return tx.Commit()
+	}
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO refund_outbox (id, aggregate_id, event_type, payload)
+		VALUES ($1, $2, $3, $4::jsonb)
+	`, request.EventID, request.OrderID, result.EventType, string(payload))
+	if err != nil {
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	log.Printf("Refund result saved for order %s", request.OrderID)
+	return nil
 }
